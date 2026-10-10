@@ -636,3 +636,82 @@ func TestPipelineSeedChangeMissesCache(t *testing.T) {
 		t.Errorf("log must name the pinned lockfile:\n%s", log)
 	}
 }
+
+// A cache that cannot be read or written must cost a resolve, never a build.
+func TestPipelineSurvivesUnusableDepsDir(t *testing.T) {
+	repo, assets, c1 := fixtureRepo(t)
+	// A file where the cache dir should be: reads and MkdirAll both fail, and
+	// unlike a chmod this holds even for a root test run.
+	blocked := filepath.Join(t.TempDir(), "deps")
+	if err := os.WriteFile(blocked, []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := newPipelineDeps(t, assets, blocked)
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, c1, "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
+		t.Fatalf("an unusable cache must not fail the build: %v\nlog:\n%s", err, log)
+	}
+	if !strings.Contains(log.String(), "deps cache read failed") {
+		t.Errorf("expected a cache read warning:\n%s", log)
+	}
+}
+
+// The same, on the path that tries to write: the resolve still succeeds.
+func TestPipelineColdResolveWithUnusableDepsDir(t *testing.T) {
+	repo, assets, _ := fixtureRepo(t)
+	blocked := filepath.Join(t.TempDir(), "deps")
+	if err := os.WriteFile(blocked, []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, fake := newPipelineDeps(t, assets, blocked)
+	fake.FailNpmCI = testutil.NpmCIFailAlways
+	testutil.WriteFile(t, repo, "package.json", "{\"name\":\"lampa\",\"version\":\"0.0.2\"}\n")
+	testutil.CommitAll(t, repo, "bump deps")
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, "HEAD", "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
+		t.Fatalf("a failed cache write must not fail the build: %v\nlog:\n%s", err, log)
+	}
+	if !strings.Contains(log.String(), "cannot cache the resolved lockfile") {
+		t.Errorf("expected a cache write warning:\n%s", log)
+	}
+}
+
+// A corrupt entry makes npm ci fail; the pipeline resolves and replaces it
+// rather than failing the build forever.
+func TestPipelineReplacesCorruptCachedLock(t *testing.T) {
+	repo, assets, c1 := fixtureRepo(t)
+	deps := t.TempDir()
+	p, fake := newPipelineDeps(t, assets, deps)
+
+	seed, err := os.ReadFile(filepath.Join(assets, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.1\"}\n")
+	key := DepsStamp(pkg, seed)
+	const corrupt = "not json\n"
+	if _, err := storeCachedLock(deps, key, []byte(corrupt)); err != nil {
+		t.Fatal(err)
+	}
+	// npm ci cannot install the corrupt entry, so the probe fails too and the
+	// pipeline resolves.
+	fake.FailNpmCI = testutil.NpmCIFailAlways
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, c1, "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
+		t.Fatalf("run: %v\nlog:\n%s", err, log)
+	}
+	raw, ok, err := loadCachedLock(deps, key)
+	if err != nil || !ok {
+		t.Fatalf("load after heal = (ok %v, err %v)", ok, err)
+	}
+	if string(raw) == corrupt {
+		t.Error("the corrupt entry must be replaced by the fresh resolution")
+	}
+	installed, err := os.ReadFile(filepath.Join(repo, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, installed) {
+		t.Errorf("cached = %q, want the resolved %q", raw, installed)
+	}
+}
