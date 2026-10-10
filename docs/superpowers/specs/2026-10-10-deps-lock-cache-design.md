@@ -56,16 +56,21 @@
 обязанности обновлять репозиторий при каждом изменении upstream-манифеста.
 
 **Гарантия:** одинаковый seed + одинаковый upstream-манифест → одинаковый
-resolved lockfile в любой рабочей копии, в любой момент и после любого сноса
-`node_modules`. Байт-идентичность итогового архива не гарантируется: детерминизм
-самого bundler'а вне этой задачи.
+resolved lockfile в любой рабочей копии и после любого сноса `node_modules` —
+пока запись кэша для этой пары существует. Гарантия перестаёт действовать, если
+запись вытеснена (больше `depsCacheKept` разных ревизий манифеста) или
+зафиксирована заново: при транзиентном сбое `npm ci`, который провалил и
+`--dry-run` probe, `npm install` перезапишет запись свежим resolve (см.
+«Отклонения» в плане). Байт-идентичность итогового архива не гарантируется:
+детерминизм самого bundler'а вне этой задачи.
 
 ## Решение
 
 Пин из репозитория становится **seed**, авторитет — зафиксированный resolve в
 `DATA_DIR/deps/`, ключ — `DepsStamp(upstream package.json, seed lockfile)`, то
-есть уже существующая функция `pipeline.DepsStamp` (`pipeline.go:233`). Имя записи
-совпадает со значением stamp, которое пишется в `node_modules/.fe-lock-stamp`.
+есть уже существующая функция `pipeline.DepsStamp`. Имя записи — сам ключ
+(`<key>.lock.json`); значение, которое пишется в `node_modules/.fe-lock-stamp`,
+считается от эффективного lockfile, то есть от того, что реально получил npm.
 
 Ключ включает upstream-манифест, поэтому правка манифеста (новая, удалённая или
 сдвинутая зависимость) даёт новый ключ: запись не бывает рассинхронизирована с
@@ -154,11 +159,17 @@ write(workDir/node_modules/.fe-lock-stamp, want)
 ## Лог
 
 ```
-deps: cached lockfile 9f2c8a1b (manifest 3e06286, seed 4b1d0e77)
-deps: seed lockfile 9f2c8a1b — npm ci
-WARN: manifest/seed desync — resolved, cached as 9f2c8a1b
-deps cache: pruned 3 entries
+deps: cached lockfile 9f2c8a1b
+deps: pinned lockfile 9f2c8a1b — no cached resolution for this manifest/seed pair
+WARN: lockfile out of sync with upstream package.json — re-resolving (npm install)
+deps: froze the resolved lockfile as 9f2c8a1b
+deps: pruned 3 old cached lockfiles
+WARN: deps cache read failed: <err> — using the pinned lockfile
+WARN: cannot cache the resolved lockfile: <err>
+WARN: cannot prune the deps cache: <err>
 ```
+
+Ключ в строках показан как первые 8 hex-символов (`stampShort`).
 
 Доступно через существующий `GET /api/v1/builds/{id}/logs` (`internal/api/api.go:180`),
 изменений в `state`/`api` не требуется.
@@ -195,6 +206,9 @@ cache hit. Дубль получает детерминированную ими
   (`builder.go:102-115`), `rename` нужен против падения процесса, не против гонки.
 - Пересмотр `.bak` — остаётся как сейчас.
 - Детерминизм самого bundler'а.
+- Остатки `tmp-*` в `DATA_DIR/deps` после kill процесса между созданием временного
+  файла и `rename` не убираются: окно микросекундное, файл безвреден (glob
+  `*.lock.json` его не видит). При необходимости — sweep в `pruneDepsCache`.
 
 ## Документация
 
