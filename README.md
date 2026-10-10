@@ -106,9 +106,10 @@ stamp) и получают один и тот же набор версий. Кэ
   копии и состояние): сборки возвращаются к seed, а холодный resolve повторяется
   только там, где seed уже не удовлетворяет манифесту;
 - недоступный для записи `DATA_DIR/deps` не ломает сборку: билд работает по seed
-  без фиксации resolve (`WARN: ...` в `build.log`);
+  без фиксации resolve (если resolve всё-таки понадобился, в `build.log` будет
+  `WARN: ...`);
 - какие версии фактически поставлены, видно в `build.log` сборки — строки
-  `deps: cached lockfile <key>` и `deps: pinned lockfile <key>`, где `<key>` —
+  `deps: cached lockfile <key>` и `deps: pinned lockfile <key> …`, где `<key>` —
   первые 8 символов ключа.
 
 ## Разработка
