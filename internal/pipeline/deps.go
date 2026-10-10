@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 )
@@ -38,4 +40,82 @@ func depsEvictPlan(entries []depsEntry, keep int) []string {
 		evict = append(evict, sorted[i].name)
 	}
 	return evict
+}
+
+// depsLockPath is where the resolved lockfile for a DepsStamp key lives.
+func depsLockPath(depsDir, key string) string {
+	return filepath.Join(depsDir, key+".lock.json")
+}
+
+// loadCachedLock returns the resolved lockfile frozen for key. A missing file
+// is a miss, not an error; any other read failure is returned so the caller can
+// warn and fall back to the seed.
+func loadCachedLock(depsDir, key string) (raw []byte, ok bool, err error) {
+	raw, err = os.ReadFile(depsLockPath(depsDir, key))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return raw, true, nil
+}
+
+// storeCachedLock freezes raw as the resolved lockfile for key and drops the
+// oldest entries beyond depsCacheKept, returning how many it removed. The write
+// goes through a temp file and rename so a crash cannot leave a torn entry that
+// npm ci would later choke on (the same idiom as gitops.EnsureCopy, issue #10).
+func storeCachedLock(depsDir, key string, raw []byte) (pruned int, err error) {
+	if err := os.MkdirAll(depsDir, 0o755); err != nil {
+		return 0, err
+	}
+	tmp, err := os.CreateTemp(depsDir, "tmp-*")
+	if err != nil {
+		return 0, err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return 0, err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return 0, err
+	}
+	if err := os.Rename(tmpName, depsLockPath(depsDir, key)); err != nil {
+		os.Remove(tmpName)
+		return 0, err
+	}
+	evict, err := depsCacheEvictPlan(depsDir)
+	if err != nil {
+		return 0, err
+	}
+	for _, name := range evict {
+		if err := os.Remove(filepath.Join(depsDir, name)); err != nil {
+			return 0, err
+		}
+	}
+	return len(evict), nil
+}
+
+// depsCacheEvictPlan lists the entries the cache must drop to stay within
+// depsCacheKept, oldest first.
+func depsCacheEvictPlan(depsDir string) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(depsDir, "*.lock.json"))
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]depsEntry, 0, len(matches))
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // vanished under us; nothing to plan for it
+			}
+			return nil, err
+		}
+		entries = append(entries, depsEntry{name: filepath.Base(path), modTime: info.ModTime()})
+	}
+	return depsEvictPlan(entries, depsCacheKept), nil
 }

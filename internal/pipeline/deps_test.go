@@ -1,6 +1,10 @@
 package pipeline
 
 import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -59,5 +63,66 @@ func TestDepsEvictPlan(t *testing.T) {
 				t.Errorf("depsEvictPlan = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+func TestLoadAndStoreCachedLock(t *testing.T) {
+	deps := t.TempDir()
+	const key = "9f2c8a1b"
+
+	if raw, ok, err := loadCachedLock(deps, key); err != nil || ok || raw != nil {
+		t.Fatalf("miss on an empty cache = (%q, %v, %v), want (nil, false, nil)", raw, ok, err)
+	}
+
+	resolved := []byte("{\"lockfileVersion\":3}\n")
+	pruned, err := storeCachedLock(deps, key, resolved)
+	if err != nil || pruned != 0 {
+		t.Fatalf("store = (%d, %v), want (0, nil)", pruned, err)
+	}
+	raw, ok, err := loadCachedLock(deps, key)
+	if err != nil || !ok {
+		t.Fatalf("load after store = (ok %v, err %v), want ok", ok, err)
+	}
+	if !bytes.Equal(raw, resolved) {
+		t.Errorf("loaded = %q, want %q", raw, resolved)
+	}
+	// The store goes through a temp file: no leftovers in the cache dir.
+	names, err := filepath.Glob(filepath.Join(deps, "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 {
+		t.Errorf("cache dir = %v, want exactly the entry", names)
+	}
+}
+
+func TestStoreCachedLockPrunesOldest(t *testing.T) {
+	deps := t.TempDir()
+	// More entries than the limit, with distinct mtimes so the order is defined.
+	for i := 0; i < depsCacheKept+3; i++ {
+		key := fmt.Sprintf("%08d", i)
+		if _, err := storeCachedLock(deps, key, []byte("{}\n")); err != nil {
+			t.Fatal(err)
+		}
+		when := time.Unix(int64(1000+i), 0)
+		if err := os.Chtimes(depsLockPath(deps, key), when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names, err := filepath.Glob(filepath.Join(deps, "*.lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != depsCacheKept {
+		t.Fatalf("cache holds %d entries, want %d: %v", len(names), depsCacheKept, names)
+	}
+	for _, gone := range []string{"00000000", "00000001", "00000002"} {
+		if _, ok, err := loadCachedLock(deps, gone); err != nil || ok {
+			t.Errorf("entry %s = (ok %v, err %v), want pruned", gone, ok, err)
+		}
+	}
+	newest := fmt.Sprintf("%08d", depsCacheKept+2)
+	if _, ok, err := loadCachedLock(deps, newest); err != nil || !ok {
+		t.Errorf("newest entry %s = (ok %v, err %v), want kept", newest, ok, err)
 	}
 }
