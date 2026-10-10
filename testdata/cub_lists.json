@@ -1,0 +1,17 @@
+{
+  "_comment": "Pinned copies for the consistency test (issue #7). Update in the same PR that changes lampa-go config or the upstream list; see docs/superpowers/specs/2026-10-09-restart-integrity-lists-design.md. The sha fields record the source revision the copies were taken from.",
+  "lampa_go": {
+    "repo": "huhen/lampa-go",
+    "ref": "feature/builder-integration",
+    "sha": "84c1979945f5ceb16f8e63c4c17bc4299eb410a4",
+    "field": "internal/config/config.go: SubdomainMarkers default",
+    "subdomain_markers": ["tmdb", "geo", "ws", "imagetmdb", "cdn", "ad"]
+  },
+  "upstream": {
+    "repo": "https://github.com/yumata/lampa-source.git",
+    "ref": "main",
+    "sha": "3e06286753fbbaf54496316671bab46bbfb54c9c",
+    "field": "src/core/manifest.js: cub_mirrors (pre-patch)",
+    "cub_mirrors": ["cub.best", "cub.black", "durex.monster", "cubnotrip.top"]
+  }
+}

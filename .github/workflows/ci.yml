@@ -1,0 +1,126 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# A new push to a PR branch supersedes the previous run of the same branch;
+# main and tag runs are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          # The module has no external dependencies and no go.sum: nothing to cache.
+          cache: false
+      - run: go vet ./...
+      - run: go test ./...
+
+  # The image is published only from main/tags, so PRs need their own guard
+  # (issue #8): build it and assert the runtime user and /data ownership.
+  image-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the image
+        run: docker build --build-arg VERSION=ci -t lampa-web-builder:ci .
+      - name: Smoke-test the runtime user and /data ownership
+        run: |
+          set -euo pipefail
+          id_out=$(docker run --rm --entrypoint id lampa-web-builder:ci)
+          echo "$id_out"
+          case "$id_out" in
+            *uid=10001*) ;;
+            *) echo "::error::image does not run as uid 10001"; exit 1 ;;
+          esac
+          docker volume create lwb-ci
+          docker run --rm -v lwb-ci:/data --entrypoint sh lampa-web-builder:ci \
+            -c 'touch /data/probe && test "$(stat -c %u /data/probe)" = 10001'
+          docker volume rm lwb-ci
+      - name: Server starts and writes state.json as builder
+        run: |
+          set -euo pipefail
+          docker volume create lwb-ci
+          trap 'docker rm -f lwb-ci-run >/dev/null 2>&1 || true; docker volume rm lwb-ci >/dev/null 2>&1 || true' EXIT
+          docker run --rm -d --name lwb-ci-run -v lwb-ci:/data \
+            -p 127.0.0.1:18080:8080 \
+            -e API_KEY=smoke -e DEFAULT_DOMAIN=localhost lampa-web-builder:ci
+          for _ in $(seq 1 20); do
+            docker run --rm -v lwb-ci:/data --entrypoint sh lampa-web-builder:ci \
+              -c 'test -s /data/state.json' && break
+            sleep 0.5
+          done
+          owner=$(docker run --rm -v lwb-ci:/data --entrypoint sh lampa-web-builder:ci -c 'stat -c %u /data/state.json')
+          test "$owner" = 10001
+          curl -sf --retry 10 --retry-connrefused --retry-delay 1 \
+            -H 'X-API-Key: smoke' http://127.0.0.1:18080/api/v1/status | grep -q '"version":"ci"'
+
+  # Every merge to main publishes an image: main (moving, latest build of the
+  # branch) and sha-<short> (pinned to the built commit). Release tags keep
+  # version tags and latest.
+  docker-main:
+    if: github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ghcr.io/huhen/lampa-web-builder
+          tags: |
+            type=raw,value=main
+            type=sha
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=sha-${{ github.sha }}
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ghcr.io/huhen/lampa-web-builder
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ github.ref_name }}
