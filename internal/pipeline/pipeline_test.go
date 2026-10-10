@@ -501,3 +501,84 @@ func entryNames(entries map[string]*tar.Header) []string {
 	sort.Strings(out)
 	return out
 }
+
+func TestPipelineUsesCachedLockfile(t *testing.T) {
+	repo, assets, c1 := fixtureRepo(t)
+	deps := t.TempDir()
+	p, fake := newPipelineDeps(t, assets, deps)
+
+	seed, err := os.ReadFile(filepath.Join(assets, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.1\"}\n")
+	cached := []byte("{\"lockfileVersion\":3,\"frozen\":true}\n")
+	if _, err := storeCachedLock(deps, DepsStamp(pkg, seed), cached); err != nil {
+		t.Fatal(err)
+	}
+
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, c1, "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
+		t.Fatalf("run: %v\nlog:\n%s", err, log)
+	}
+
+	// The frozen entry is what npm was given — byte for byte.
+	lock, err := os.ReadFile(filepath.Join(repo, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(lock, cached) {
+		t.Errorf("installed lockfile = %q, want the cached %q", lock, cached)
+	}
+	for _, c := range fake.CallsSnapshot() {
+		if strings.HasPrefix(c, "npm install") {
+			t.Errorf("a cache hit must not re-resolve: %v", fake.CallsSnapshot())
+		}
+	}
+	if !strings.Contains(log.String(), "cached lockfile") {
+		t.Errorf("log does not name the cached lockfile:\n%s", log)
+	}
+	// The stamp describes the cached tree, so the next build skips the install.
+	stamp, err := os.ReadFile(filepath.Join(repo, "node_modules", ".fe-lock-stamp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stamp) != DepsStamp(pkg, cached) {
+		t.Errorf("stamp = %q, want %q", stamp, DepsStamp(pkg, cached))
+	}
+}
+
+// A seed change is a deliberate pin bump: it must miss the cache and install
+// the new pin instead of the entry frozen for the old one.
+func TestPipelineSeedChangeMissesCache(t *testing.T) {
+	repo, assets, c1 := fixtureRepo(t)
+	deps := t.TempDir()
+	p, _ := newPipelineDeps(t, assets, deps)
+
+	seed, err := os.ReadFile(filepath.Join(assets, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.1\"}\n")
+	cached := []byte("{\"lockfileVersion\":3,\"frozen\":true}\n")
+	if _, err := storeCachedLock(deps, DepsStamp(pkg, seed), cached); err != nil {
+		t.Fatal(err)
+	}
+	newSeed := "{\"lockfile\":true,\"bump\":1}\n"
+	testutil.WriteFile(t, assets, "package-lock.json", newSeed)
+
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, c1, "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
+		t.Fatalf("run: %v\nlog:\n%s", err, log)
+	}
+	lock, err := os.ReadFile(filepath.Join(repo, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(lock) != newSeed {
+		t.Errorf("installed lockfile = %q, want the new seed", lock)
+	}
+	if !strings.Contains(log.String(), "pinned lockfile") {
+		t.Errorf("log must name the pinned lockfile:\n%s", log)
+	}
+}

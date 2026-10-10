@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -59,6 +61,25 @@ func loadCachedLock(depsDir, key string) (raw []byte, ok bool, err error) {
 		return nil, false, err
 	}
 	return raw, true, nil
+}
+
+// effectiveLock picks the lockfile npm is given: the resolution frozen in the
+// cache for key when one exists, the seed otherwise. A cache read failure warns
+// and falls back to the seed — that costs a resolve, it does not fail a build.
+func (p *Pipeline) effectiveLock(seed []byte, key string, log io.Writer) []byte {
+	cached, ok, err := loadCachedLock(p.DepsDir, key)
+	switch {
+	case err != nil:
+		fmt.Fprintf(log, "WARN: deps cache read failed: %v — using the pinned lockfile\n", err)
+		return seed
+	case ok:
+		fmt.Fprintf(log, "deps: cached lockfile %s\n", stampShort([]byte(key)))
+		return cached
+	default:
+		fmt.Fprintf(log, "deps: pinned lockfile %s — no cached resolution for this manifest\n",
+			stampShort([]byte(key)))
+		return seed
+	}
 }
 
 // storeCachedLock freezes raw as the resolved lockfile for key and drops the
