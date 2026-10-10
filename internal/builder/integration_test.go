@@ -55,7 +55,7 @@ func TestIntegrationUpstreamSwapAndBadCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := &testutil.FakeRunner{Stamp: pipeline.DepsStamp}
-	pipe, err := pipeline.New(assets, runner)
+	pipe, err := pipeline.New(assets, filepath.Join(cfg.DataDir, "deps"), runner)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -43,7 +43,7 @@ func TestFullBuildE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := New(assets, execrun.ExecRunner{})
+	p, err := New(assets, filepath.Join(tmp, "deps"), execrun.ExecRunner{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,20 +26,31 @@ type BuildRunner interface {
 }
 
 // Pipeline executes the recipe on working copies using assetsDir
-// (patches/, overlay/, package-lock.json).
+// (patches/, overlay/, package-lock.json) and freezes resolved dependency
+// lockfiles in depsDir.
 type Pipeline struct {
 	AssetsDir string // absolute
+	DepsDir   string // absolute; one .lock.json per (manifest, seed) key
 	Runner    execrun.Runner
 }
 
-// New resolves assetsDir to an absolute path (commands run with a different
-// working directory, so relative asset paths would break).
-func New(assetsDir string, r execrun.Runner) (*Pipeline, error) {
-	abs, err := filepath.Abs(assetsDir)
+// New resolves assetsDir and depsDir to absolute paths (commands run with a
+// different working directory, so relative asset paths would break).
+func New(assetsDir, depsDir string, r execrun.Runner) (*Pipeline, error) {
+	if depsDir == "" {
+		// An empty deps dir would resolve to the process working directory and
+		// scatter cache entries into it.
+		return nil, errors.New("deps dir is required")
+	}
+	absAssets, err := filepath.Abs(assetsDir)
 	if err != nil {
 		return nil, err
 	}
-	return &Pipeline{AssetsDir: abs, Runner: r}, nil
+	absDeps, err := filepath.Abs(depsDir)
+	if err != nil {
+		return nil, err
+	}
+	return &Pipeline{AssetsDir: absAssets, DepsDir: absDeps, Runner: r}, nil
 }
 
 // Run executes the whole recipe on workDir for (commit, domain) and writes

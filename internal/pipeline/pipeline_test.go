@@ -42,14 +42,29 @@ func fixtureRepo(t *testing.T) (repo, assets, c1 string) {
 	return repo, assets, c1
 }
 
+// newPipeline builds a pipeline whose deps cache lives in a throwaway dir;
+// tests that assert on the cache use newPipelineDeps with their own.
 func newPipeline(t *testing.T, assets string) (*Pipeline, *testutil.FakeRunner) {
 	t.Helper()
+	return newPipelineDeps(t, assets, t.TempDir())
+}
+
+func newPipelineDeps(t *testing.T, assets, deps string) (*Pipeline, *testutil.FakeRunner) {
+	t.Helper()
 	fake := &testutil.FakeRunner{Stamp: DepsStamp}
-	p, err := New(assets, fake)
+	p, err := New(assets, deps, fake)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return p, fake
+}
+
+// An empty deps dir would resolve to the process working directory and scatter
+// cache entries into it, so New rejects it outright.
+func TestNewRejectsEmptyDepsDir(t *testing.T) {
+	if _, err := New(t.TempDir(), "", &testutil.FakeRunner{}); err == nil {
+		t.Error("empty deps dir must be rejected")
+	}
 }
 
 func TestPipelineRunFull(t *testing.T) {
@@ -208,7 +223,7 @@ func TestRerunAfterPatchConflict(t *testing.T) {
 func TestRerunAfterBuildFailure(t *testing.T) {
 	repo, assets, c1 := fixtureRepo(t)
 	broken := &testutil.FakeRunner{Stamp: DepsStamp, SilentGulp: true}
-	p, err := New(assets, broken)
+	p, err := New(assets, t.TempDir(), broken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +384,7 @@ func TestPipelineMissingBuildOutput(t *testing.T) {
 	// SilentGulp: gulp "succeeds" but writes nothing -> the recipe must fail
 	// with the missing-output error.
 	fake := &testutil.FakeRunner{Stamp: DepsStamp, SilentGulp: true}
-	p, err := New(assets, fake)
+	p, err := New(assets, t.TempDir(), fake)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +400,7 @@ func TestPipelineEmptyBuildOutputFails(t *testing.T) {
 	// EmptyGulp: gulp "succeeds" but packs nothing -> an empty archive would
 	// look like a valid build downstream, so the recipe must fail.
 	fake := &testutil.FakeRunner{Stamp: DepsStamp, EmptyGulp: true}
-	p, err := New(assets, fake)
+	p, err := New(assets, t.TempDir(), fake)
 	if err != nil {
 		t.Fatal(err)
 	}

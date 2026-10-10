@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -42,7 +43,7 @@ func run() error {
 	}
 	exe := execrun.ExecRunner{}
 	git := gitops.NewClient(cfg.UpstreamRepo, cfg.UpstreamBranch, exe)
-	pipe, err := pipeline.New(cfg.AssetsDir, exe)
+	pipe, err := pipeline.New(cfg.AssetsDir, filepath.Join(cfg.DataDir, "deps"), exe)
 	if err != nil {
 		return err
 	}
