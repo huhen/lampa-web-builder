@@ -71,9 +71,12 @@ func (f *FakeRunner) Run(ctx context.Context, dir string, w io.Writer, name stri
 					return nil
 				}
 			}
-			return f.fakeInstall(dir)
+			return f.fakeInstall(dir, false)
 		case "install":
-			return f.fakeInstall(dir)
+			// Real npm install re-resolves and rewrites the lockfile; npm ci
+			// does not. Tests rely on that difference to tell a re-resolution
+			// from an install of a frozen lockfile.
+			return f.fakeInstall(dir, true)
 		default:
 			return fmt.Errorf("fake runner: unexpected npm subcommand %q", args[0])
 		}
@@ -125,15 +128,23 @@ func (FakeExec) RunRaw(ctx context.Context, dir string, w io.Writer, name string
 	return cmd.Run()
 }
 
-func (f *FakeRunner) fakeInstall(dir string) error {
+func (f *FakeRunner) fakeInstall(dir string, rewriteLock bool) error {
 	if f.Stamp == nil {
 		return fmt.Errorf("FakeRunner.Stamp is not set")
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
-		return err
-	}
 	pkg, err := os.ReadFile(filepath.Join(dir, "package.json"))
 	if err != nil {
+		return err
+	}
+	if rewriteLock {
+		// Deterministic stand-in for npm's resolution: derived from the
+		// manifest, so tests can tell a resolved lockfile from the seed.
+		resolved := fmt.Sprintf("{\"lockfileVersion\":3,\"resolved_from\":%q}\n", pkg)
+		if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte(resolved), 0o644); err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
 		return err
 	}
 	lock, err := os.ReadFile(filepath.Join(dir, "package-lock.json"))
