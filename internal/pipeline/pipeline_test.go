@@ -42,14 +42,29 @@ func fixtureRepo(t *testing.T) (repo, assets, c1 string) {
 	return repo, assets, c1
 }
 
+// newPipeline builds a pipeline whose deps cache lives in a throwaway dir;
+// tests that assert on the cache use newPipelineDeps with their own.
 func newPipeline(t *testing.T, assets string) (*Pipeline, *testutil.FakeRunner) {
 	t.Helper()
+	return newPipelineDeps(t, assets, t.TempDir())
+}
+
+func newPipelineDeps(t *testing.T, assets, deps string) (*Pipeline, *testutil.FakeRunner) {
+	t.Helper()
 	fake := &testutil.FakeRunner{Stamp: DepsStamp}
-	p, err := New(assets, fake)
+	p, err := New(assets, deps, fake)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return p, fake
+}
+
+// An empty deps dir would resolve to the process working directory and scatter
+// cache entries into it, so New rejects it outright.
+func TestNewRejectsEmptyDepsDir(t *testing.T) {
+	if _, err := New(t.TempDir(), "", &testutil.FakeRunner{}); err == nil {
+		t.Error("empty deps dir must be rejected")
+	}
 }
 
 func TestPipelineRunFull(t *testing.T) {
@@ -208,7 +223,7 @@ func TestRerunAfterPatchConflict(t *testing.T) {
 func TestRerunAfterBuildFailure(t *testing.T) {
 	repo, assets, c1 := fixtureRepo(t)
 	broken := &testutil.FakeRunner{Stamp: DepsStamp, SilentGulp: true}
-	p, err := New(assets, broken)
+	p, err := New(assets, t.TempDir(), broken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,11 +259,13 @@ func TestRerunAfterBuildFailure(t *testing.T) {
 
 func TestPipelineLockfileDesyncResolves(t *testing.T) {
 	repo, assets, _ := fixtureRepo(t)
-	p, fake := newPipeline(t, assets)
+	deps := t.TempDir()
+	p, fake := newPipelineDeps(t, assets, deps)
 	// The preset fails both the install and the --dry-run probe, so npm ci
 	// fails for a desync and the pipeline re-resolves.
 	fake.FailNpmCI = testutil.NpmCIFailAlways
-	testutil.WriteFile(t, repo, "package.json", `{"name":"lampa","version":"0.0.2"}`+"\n")
+	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.2\"}\n")
+	testutil.WriteFile(t, repo, "package.json", string(pkg))
 	testutil.CommitAll(t, repo, "bump deps")
 	log := &bytes.Buffer{}
 	if err := p.Run(context.Background(), repo, "HEAD", "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
@@ -268,6 +285,58 @@ func TestPipelineLockfileDesyncResolves(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), "re-resolving") {
 		t.Errorf("warning missing from log:\n%s", log)
+	}
+
+	// The resolution is frozen: it is what npm was given and what the cache
+	// now holds, so the next build never resolves again.
+	installed, err := os.ReadFile(filepath.Join(repo, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, err := os.ReadFile(filepath.Join(assets, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(installed, seed) {
+		t.Fatal("npm install was expected to rewrite the lockfile")
+	}
+	cached, ok, err := loadCachedLock(deps, DepsStamp(pkg, seed))
+	if err != nil || !ok {
+		t.Fatalf("cold resolve must freeze the lockfile: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(cached, installed) {
+		t.Errorf("cached = %q, want the resolved %q", cached, installed)
+	}
+}
+
+// After a cold resolve the frozen entry is the effective lockfile, and the
+// stamp written for it makes the next build skip the install entirely.
+func TestPipelineSecondBuildSkipsInstallAfterResolve(t *testing.T) {
+	repo, assets, _ := fixtureRepo(t)
+	deps := t.TempDir()
+	p, fake := newPipelineDeps(t, assets, deps)
+	fake.FailNpmCI = testutil.NpmCIFailAlways
+	testutil.WriteFile(t, repo, "package.json", "{\"name\":\"lampa\",\"version\":\"0.0.2\"}\n")
+	testutil.CommitAll(t, repo, "bump deps")
+	if err := p.Run(context.Background(), repo, "HEAD", "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A working npm now: the entry is in sync, so npm ci would succeed — the
+	// point is that neither it nor npm install runs at all.
+	fake.FailNpmCI = nil
+	before := len(fake.CallsSnapshot())
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, "HEAD", "test.example", filepath.Join(t.TempDir(), "b.tar.gz"), log); err != nil {
+		t.Fatalf("second build: %v\nlog:\n%s", err, log)
+	}
+	for _, c := range fake.CallsSnapshot()[before:] {
+		if strings.HasPrefix(c, "npm ci") || strings.HasPrefix(c, "npm install") {
+			t.Errorf("second build must skip the install, calls: %v", fake.CallsSnapshot()[before:])
+		}
+	}
+	if !strings.Contains(log.String(), "cached lockfile") {
+		t.Errorf("second build must use the frozen lockfile:\n%s", log)
 	}
 }
 
@@ -369,7 +438,7 @@ func TestPipelineMissingBuildOutput(t *testing.T) {
 	// SilentGulp: gulp "succeeds" but writes nothing -> the recipe must fail
 	// with the missing-output error.
 	fake := &testutil.FakeRunner{Stamp: DepsStamp, SilentGulp: true}
-	p, err := New(assets, fake)
+	p, err := New(assets, t.TempDir(), fake)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +454,7 @@ func TestPipelineEmptyBuildOutputFails(t *testing.T) {
 	// EmptyGulp: gulp "succeeds" but packs nothing -> an empty archive would
 	// look like a valid build downstream, so the recipe must fail.
 	fake := &testutil.FakeRunner{Stamp: DepsStamp, EmptyGulp: true}
-	p, err := New(assets, fake)
+	p, err := New(assets, t.TempDir(), fake)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,4 +554,185 @@ func entryNames(entries map[string]*tar.Header) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func TestPipelineUsesCachedLockfile(t *testing.T) {
+	repo, assets, c1 := fixtureRepo(t)
+	deps := t.TempDir()
+	p, fake := newPipelineDeps(t, assets, deps)
+
+	seed, err := os.ReadFile(filepath.Join(assets, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.1\"}\n")
+	cached := []byte("{\"lockfileVersion\":3,\"frozen\":true}\n")
+	if err := storeCachedLock(deps, DepsStamp(pkg, seed), cached); err != nil {
+		t.Fatal(err)
+	}
+
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, c1, "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
+		t.Fatalf("run: %v\nlog:\n%s", err, log)
+	}
+
+	// The frozen entry is what npm was given — byte for byte.
+	lock, err := os.ReadFile(filepath.Join(repo, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(lock, cached) {
+		t.Errorf("installed lockfile = %q, want the cached %q", lock, cached)
+	}
+	for _, c := range fake.CallsSnapshot() {
+		if strings.HasPrefix(c, "npm install") {
+			t.Errorf("a cache hit must not re-resolve: %v", fake.CallsSnapshot())
+		}
+	}
+	if !strings.Contains(log.String(), "cached lockfile") {
+		t.Errorf("log does not name the cached lockfile:\n%s", log)
+	}
+	// The stamp describes the cached tree, so the next build skips the install.
+	stamp, err := os.ReadFile(filepath.Join(repo, "node_modules", ".fe-lock-stamp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stamp) != DepsStamp(pkg, cached) {
+		t.Errorf("stamp = %q, want %q", stamp, DepsStamp(pkg, cached))
+	}
+}
+
+// A seed change is a deliberate pin bump: it must miss the cache and install
+// the new pin instead of the entry frozen for the old one.
+func TestPipelineSeedChangeMissesCache(t *testing.T) {
+	repo, assets, c1 := fixtureRepo(t)
+	deps := t.TempDir()
+	p, _ := newPipelineDeps(t, assets, deps)
+
+	seed, err := os.ReadFile(filepath.Join(assets, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.1\"}\n")
+	cached := []byte("{\"lockfileVersion\":3,\"frozen\":true}\n")
+	if err := storeCachedLock(deps, DepsStamp(pkg, seed), cached); err != nil {
+		t.Fatal(err)
+	}
+	newSeed := "{\"lockfile\":true,\"bump\":1}\n"
+	testutil.WriteFile(t, assets, "package-lock.json", newSeed)
+
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, c1, "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
+		t.Fatalf("run: %v\nlog:\n%s", err, log)
+	}
+	lock, err := os.ReadFile(filepath.Join(repo, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(lock) != newSeed {
+		t.Errorf("installed lockfile = %q, want the new seed", lock)
+	}
+	if !strings.Contains(log.String(), "pinned lockfile") {
+		t.Errorf("log must name the pinned lockfile:\n%s", log)
+	}
+}
+
+// A cache that cannot be read or written must cost a resolve, never a build.
+func TestPipelineSurvivesUnusableDepsDir(t *testing.T) {
+	repo, assets, c1 := fixtureRepo(t)
+	// A file where the cache dir should be: reads and MkdirAll both fail, and
+	// unlike a chmod this holds even for a root test run.
+	blocked := filepath.Join(t.TempDir(), "deps")
+	if err := os.WriteFile(blocked, []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := newPipelineDeps(t, assets, blocked)
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, c1, "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
+		t.Fatalf("an unusable cache must not fail the build: %v\nlog:\n%s", err, log)
+	}
+	if !strings.Contains(log.String(), "deps cache read failed") {
+		t.Errorf("expected a cache read warning:\n%s", log)
+	}
+}
+
+// The same, on the path that tries to write: the resolve still succeeds.
+func TestPipelineColdResolveWithUnusableDepsDir(t *testing.T) {
+	repo, assets, _ := fixtureRepo(t)
+	blocked := filepath.Join(t.TempDir(), "deps")
+	if err := os.WriteFile(blocked, []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, fake := newPipelineDeps(t, assets, blocked)
+	fake.FailNpmCI = testutil.NpmCIFailAlways
+	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.2\"}\n")
+	testutil.WriteFile(t, repo, "package.json", string(pkg))
+	testutil.CommitAll(t, repo, "bump deps")
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, "HEAD", "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
+		t.Fatalf("a failed cache write must not fail the build: %v\nlog:\n%s", err, log)
+	}
+	if !strings.Contains(log.String(), "cannot cache the resolved lockfile") {
+		t.Errorf("expected a cache write warning:\n%s", log)
+	}
+	// The failed cache write must not hide the truth: the stamp still describes
+	// the tree npm actually installed, computed the way production does.
+	resolved, err := os.ReadFile(filepath.Join(repo, "package-lock.json"))
+	if err != nil {
+		t.Fatalf("read resolved lockfile: %v", err)
+	}
+	seed, err := os.ReadFile(filepath.Join(assets, "package-lock.json"))
+	if err != nil {
+		t.Fatalf("read seed lockfile: %v", err)
+	}
+	if bytes.Equal(resolved, seed) {
+		t.Fatalf("npm install was expected to rewrite the lockfile, got the seed")
+	}
+	stamp, err := os.ReadFile(filepath.Join(repo, "node_modules", ".fe-lock-stamp"))
+	if err != nil {
+		t.Fatalf("no stamp: %v", err)
+	}
+	if string(stamp) != DepsStamp(pkg, resolved) {
+		t.Errorf("stamp = %q, want %q (the tree npm installed)", stamp, DepsStamp(pkg, resolved))
+	}
+}
+
+// A corrupt entry makes npm ci fail; the pipeline resolves and replaces it
+// rather than failing the build forever.
+func TestPipelineReplacesCorruptCachedLock(t *testing.T) {
+	repo, assets, c1 := fixtureRepo(t)
+	deps := t.TempDir()
+	p, fake := newPipelineDeps(t, assets, deps)
+
+	seed, err := os.ReadFile(filepath.Join(assets, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.1\"}\n")
+	key := DepsStamp(pkg, seed)
+	const corrupt = "not json\n"
+	if err := storeCachedLock(deps, key, []byte(corrupt)); err != nil {
+		t.Fatal(err)
+	}
+	// npm ci cannot install the corrupt entry, so the probe fails too and the
+	// pipeline resolves.
+	fake.FailNpmCI = testutil.NpmCIFailAlways
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, c1, "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
+		t.Fatalf("run: %v\nlog:\n%s", err, log)
+	}
+	raw, ok, err := loadCachedLock(deps, key)
+	if err != nil || !ok {
+		t.Fatalf("load after heal = (ok %v, err %v)", ok, err)
+	}
+	if string(raw) == corrupt {
+		t.Error("the corrupt entry must be replaced by the fresh resolution")
+	}
+	installed, err := os.ReadFile(filepath.Join(repo, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, installed) {
+		t.Errorf("cached = %q, want the resolved %q", raw, installed)
+	}
 }

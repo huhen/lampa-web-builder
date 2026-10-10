@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,20 +26,31 @@ type BuildRunner interface {
 }
 
 // Pipeline executes the recipe on working copies using assetsDir
-// (patches/, overlay/, package-lock.json).
+// (patches/, overlay/, package-lock.json) and freezes resolved dependency
+// lockfiles in depsDir.
 type Pipeline struct {
 	AssetsDir string // absolute
+	DepsDir   string // absolute; one .lock.json per (manifest, seed) key
 	Runner    execrun.Runner
 }
 
-// New resolves assetsDir to an absolute path (commands run with a different
-// working directory, so relative asset paths would break).
-func New(assetsDir string, r execrun.Runner) (*Pipeline, error) {
-	abs, err := filepath.Abs(assetsDir)
+// New resolves assetsDir and depsDir to absolute paths (commands run with a
+// different working directory, so relative asset paths would break).
+func New(assetsDir, depsDir string, r execrun.Runner) (*Pipeline, error) {
+	if depsDir == "" {
+		// An empty deps dir would resolve to the process working directory and
+		// scatter cache entries into it.
+		return nil, errors.New("deps dir is required")
+	}
+	absAssets, err := filepath.Abs(assetsDir)
 	if err != nil {
 		return nil, err
 	}
-	return &Pipeline{AssetsDir: abs, Runner: r}, nil
+	absDeps, err := filepath.Abs(depsDir)
+	if err != nil {
+		return nil, err
+	}
+	return &Pipeline{AssetsDir: absAssets, DepsDir: absDeps, Runner: r}, nil
 }
 
 // Run executes the whole recipe on workDir for (commit, domain) and writes
@@ -246,10 +258,11 @@ func stampShort(raw []byte) string {
 	return v
 }
 
-// stepDeps installs npm dependencies from the pinned lockfile, skipping the
-// install entirely when node_modules is fresh (stamp matches).
+// stepDeps installs npm dependencies from the effective lockfile — the cached
+// resolution for the key when one exists, the pinned seed otherwise — and
+// skips the install entirely when node_modules is fresh (stamp matches).
 func (p *Pipeline) stepDeps(ctx context.Context, workDir string, log io.Writer) error {
-	lockRaw, err := os.ReadFile(filepath.Join(p.AssetsDir, "package-lock.json"))
+	lockSeed, err := os.ReadFile(filepath.Join(p.AssetsDir, "package-lock.json"))
 	if err != nil {
 		return fmt.Errorf("read pinned lockfile: %w", err)
 	}
@@ -257,13 +270,18 @@ func (p *Pipeline) stepDeps(ctx context.Context, workDir string, log io.Writer) 
 	if err != nil {
 		return err
 	}
-	// Upstream ships no lockfile (it is gitignored), feed ours to npm.
-	if err := os.WriteFile(filepath.Join(workDir, "package-lock.json"), lockRaw, 0o644); err != nil {
+	// The key pins both the upstream manifest and our seed: a change to either
+	// is a different dependency set, so an entry is never out of sync with the
+	// manifest it was resolved for.
+	key := DepsStamp(pkgRaw, lockSeed)
+	effective := p.effectiveLock(lockSeed, key, log)
+	// Upstream ships no lockfile (it is gitignored), feed npm ours.
+	if err := os.WriteFile(filepath.Join(workDir, "package-lock.json"), effective, 0o644); err != nil {
 		return err
 	}
 	stampPath := filepath.Join(workDir, "node_modules", ".fe-lock-stamp")
 	stamp, _ := os.ReadFile(stampPath)
-	want := DepsStamp(pkgRaw, lockRaw)
+	want := DepsStamp(pkgRaw, effective)
 	if strings.TrimSpace(string(stamp)) == want {
 		fmt.Fprintln(log, "node_modules is fresh (stamp matches), skipping npm install")
 		return nil
@@ -281,11 +299,29 @@ func (p *Pipeline) stepDeps(ctx context.Context, workDir string, log io.Writer) 
 			return fmt.Errorf("npm ci failed but the lockfile is in sync, see the log above")
 		}
 		fmt.Fprintln(log, "WARN: lockfile out of sync with upstream package.json — re-resolving (npm install)")
-		if err := os.WriteFile(filepath.Join(workDir, "package-lock.json.bak"), lockRaw, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(workDir, "package-lock.json.bak"), lockSeed, 0o644); err != nil {
 			return err
 		}
 		if err := p.run(ctx, log, workDir, []string{"npm", "install", "--no-audit", "--no-fund"}); err != nil {
 			return fmt.Errorf("npm install failed: %w", err)
+		}
+		// npm rewrote the lockfile: freeze that resolution under the key so
+		// every later build of this (manifest, seed) pair installs the same
+		// tree instead of resolving again.
+		resolved, err := os.ReadFile(filepath.Join(workDir, "package-lock.json"))
+		if err != nil {
+			return err
+		}
+		want = DepsStamp(pkgRaw, resolved)
+		if err := storeCachedLock(p.DepsDir, key, resolved); err != nil {
+			fmt.Fprintf(log, "WARN: cannot cache the resolved lockfile: %v\n", err)
+		} else {
+			fmt.Fprintf(log, "deps: froze the resolved lockfile as %s\n", stampShort([]byte(key)))
+			if pruned, err := pruneDepsCache(p.DepsDir); err != nil {
+				fmt.Fprintf(log, "WARN: cannot prune the deps cache: %v\n", err)
+			} else if pruned > 0 {
+				fmt.Fprintf(log, "deps: pruned %d old cached lockfiles\n", pruned)
+			}
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(stampPath), 0o755); err != nil {
