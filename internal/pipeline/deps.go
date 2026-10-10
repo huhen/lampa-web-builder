@@ -67,47 +67,57 @@ func loadCachedLock(depsDir, key string) (raw []byte, ok bool, err error) {
 // cache for key when one exists, the seed otherwise. A cache read failure warns
 // and falls back to the seed — that costs a resolve, it does not fail a build.
 func (p *Pipeline) effectiveLock(seed []byte, key string, log io.Writer) []byte {
+	short := stampShort([]byte(key))
 	cached, ok, err := loadCachedLock(p.DepsDir, key)
 	switch {
 	case err != nil:
 		fmt.Fprintf(log, "WARN: deps cache read failed: %v — using the pinned lockfile\n", err)
 		return seed
 	case ok:
-		fmt.Fprintf(log, "deps: cached lockfile %s\n", stampShort([]byte(key)))
+		fmt.Fprintf(log, "deps: cached lockfile %s\n", short)
 		return cached
 	default:
-		fmt.Fprintf(log, "deps: pinned lockfile %s — no cached resolution for this manifest\n",
-			stampShort([]byte(key)))
+		fmt.Fprintf(log, "deps: pinned lockfile %s — no cached resolution for this manifest/seed pair\n",
+			short)
 		return seed
 	}
 }
 
-// storeCachedLock freezes raw as the resolved lockfile for key and drops the
-// oldest entries beyond depsCacheKept, returning how many it removed. The write
-// goes through a temp file and rename so a crash cannot leave a torn entry that
-// npm ci would later choke on (the same idiom as gitops.EnsureCopy, issue #10).
-func storeCachedLock(depsDir, key string, raw []byte) (pruned int, err error) {
+// storeCachedLock freezes raw as the resolved lockfile for key. The write goes
+// through a temp file and rename so a crash cannot leave a torn entry that npm
+// ci would later choke on (the same idiom as gitops.EnsureCopy, issue #10).
+func storeCachedLock(depsDir, key string, raw []byte) error {
 	if err := os.MkdirAll(depsDir, 0o755); err != nil {
-		return 0, err
+		return err
 	}
 	tmp, err := os.CreateTemp(depsDir, "tmp-*")
 	if err != nil {
-		return 0, err
+		return err
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(raw); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
-		return 0, err
+		return err
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
-		return 0, err
+		return err
 	}
-	if err := os.Rename(tmpName, depsLockPath(depsDir, key)); err != nil {
+	// os.CreateTemp makes the entry 0600 and os.Rename preserves it; match the
+	// 0644 of every other artifact this project writes.
+	if err := os.Chmod(tmpName, 0o644); err != nil {
 		os.Remove(tmpName)
-		return 0, err
+		return err
 	}
+	return os.Rename(tmpName, depsLockPath(depsDir, key))
+}
+
+// pruneDepsCache removes the oldest cached lockfiles beyond depsCacheKept and
+// returns how many it removed. Pruning is bookkeeping separate from the write:
+// a failure leaves extra entries behind, but the frozen one is already in
+// place.
+func pruneDepsCache(depsDir string) (int, error) {
 	evict, err := depsCacheEvictPlan(depsDir)
 	if err != nil {
 		return 0, err

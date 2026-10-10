@@ -73,6 +73,14 @@ func (f *FakeRunner) Run(ctx context.Context, dir string, w io.Writer, name stri
 			}
 			return f.fakeInstall(dir, false)
 		case "install":
+			// As with ci, a --dry-run probe writes nothing for either
+			// subcommand: no lockfile rewrite, no freshness stamp (real npm
+			// --dry-run touches nothing).
+			for _, a := range args {
+				if a == "--dry-run" {
+					return nil
+				}
+			}
 			// Real npm install re-resolves and rewrites the lockfile; npm ci
 			// does not. Tests rely on that difference to tell a re-resolution
 			// from an install of a frozen lockfile.

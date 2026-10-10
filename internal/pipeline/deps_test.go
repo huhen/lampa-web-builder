@@ -75,9 +75,15 @@ func TestLoadAndStoreCachedLock(t *testing.T) {
 	}
 
 	resolved := []byte("{\"lockfileVersion\":3}\n")
-	pruned, err := storeCachedLock(deps, key, resolved)
-	if err != nil || pruned != 0 {
-		t.Fatalf("store = (%d, %v), want (0, nil)", pruned, err)
+	if err := storeCachedLock(deps, key, resolved); err != nil {
+		t.Fatalf("store = %v, want nil", err)
+	}
+	// The entry is group/other-readable like every other artifact we write
+	// (os.CreateTemp would leave it 0600 otherwise).
+	if info, err := os.Stat(depsLockPath(deps, key)); err != nil {
+		t.Fatalf("stat entry: %v", err)
+	} else if m := info.Mode().Perm(); m != 0o644 {
+		t.Errorf("entry mode = %o, want 0644", m)
 	}
 	raw, ok, err := loadCachedLock(deps, key)
 	if err != nil || !ok {
@@ -96,12 +102,12 @@ func TestLoadAndStoreCachedLock(t *testing.T) {
 	}
 }
 
-func TestStoreCachedLockPrunesOldest(t *testing.T) {
+func TestPruneDepsCacheRemovesOldest(t *testing.T) {
 	deps := t.TempDir()
 	// More entries than the limit, with distinct mtimes so the order is defined.
 	for i := 0; i < depsCacheKept+3; i++ {
 		key := fmt.Sprintf("%08d", i)
-		if _, err := storeCachedLock(deps, key, []byte("{}\n")); err != nil {
+		if err := storeCachedLock(deps, key, []byte("{}\n")); err != nil {
 			t.Fatal(err)
 		}
 		when := time.Unix(int64(1000+i), 0)
@@ -109,12 +115,17 @@ func TestStoreCachedLockPrunesOldest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The store never prunes: every entry stays in place.
 	names, err := filepath.Glob(filepath.Join(deps, "*.lock.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(names) != depsCacheKept {
-		t.Fatalf("cache holds %d entries, want %d: %v", len(names), depsCacheKept, names)
+	if len(names) != depsCacheKept+3 {
+		t.Fatalf("cache holds %d entries after store, want %d: %v", len(names), depsCacheKept+3, names)
+	}
+	pruned, err := pruneDepsCache(deps)
+	if err != nil || pruned != 3 {
+		t.Fatalf("prune = (%d, %v), want (3, nil)", pruned, err)
 	}
 	for _, gone := range []string{"00000000", "00000001", "00000002"} {
 		if _, ok, err := loadCachedLock(deps, gone); err != nil || ok {

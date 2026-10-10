@@ -313,12 +313,13 @@ func (p *Pipeline) stepDeps(ctx context.Context, workDir string, log io.Writer) 
 			return err
 		}
 		want = DepsStamp(pkgRaw, resolved)
-		pruned, err := storeCachedLock(p.DepsDir, key, resolved)
-		if err != nil {
+		if err := storeCachedLock(p.DepsDir, key, resolved); err != nil {
 			fmt.Fprintf(log, "WARN: cannot cache the resolved lockfile: %v\n", err)
 		} else {
 			fmt.Fprintf(log, "deps: froze the resolved lockfile as %s\n", stampShort([]byte(key)))
-			if pruned > 0 {
+			if pruned, err := pruneDepsCache(p.DepsDir); err != nil {
+				fmt.Fprintf(log, "WARN: cannot prune the deps cache: %v\n", err)
+			} else if pruned > 0 {
 				fmt.Fprintf(log, "deps: pruned %d old cached lockfiles\n", pruned)
 			}
 		}

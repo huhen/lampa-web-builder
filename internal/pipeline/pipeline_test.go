@@ -567,7 +567,7 @@ func TestPipelineUsesCachedLockfile(t *testing.T) {
 	}
 	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.1\"}\n")
 	cached := []byte("{\"lockfileVersion\":3,\"frozen\":true}\n")
-	if _, err := storeCachedLock(deps, DepsStamp(pkg, seed), cached); err != nil {
+	if err := storeCachedLock(deps, DepsStamp(pkg, seed), cached); err != nil {
 		t.Fatal(err)
 	}
 
@@ -615,7 +615,7 @@ func TestPipelineSeedChangeMissesCache(t *testing.T) {
 	}
 	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.1\"}\n")
 	cached := []byte("{\"lockfileVersion\":3,\"frozen\":true}\n")
-	if _, err := storeCachedLock(deps, DepsStamp(pkg, seed), cached); err != nil {
+	if err := storeCachedLock(deps, DepsStamp(pkg, seed), cached); err != nil {
 		t.Fatal(err)
 	}
 	newSeed := "{\"lockfile\":true,\"bump\":1}\n"
@@ -665,7 +665,8 @@ func TestPipelineColdResolveWithUnusableDepsDir(t *testing.T) {
 	}
 	p, fake := newPipelineDeps(t, assets, blocked)
 	fake.FailNpmCI = testutil.NpmCIFailAlways
-	testutil.WriteFile(t, repo, "package.json", "{\"name\":\"lampa\",\"version\":\"0.0.2\"}\n")
+	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.2\"}\n")
+	testutil.WriteFile(t, repo, "package.json", string(pkg))
 	testutil.CommitAll(t, repo, "bump deps")
 	log := &bytes.Buffer{}
 	if err := p.Run(context.Background(), repo, "HEAD", "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
@@ -673,6 +674,26 @@ func TestPipelineColdResolveWithUnusableDepsDir(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), "cannot cache the resolved lockfile") {
 		t.Errorf("expected a cache write warning:\n%s", log)
+	}
+	// The failed cache write must not hide the truth: the stamp still describes
+	// the tree npm actually installed, computed the way production does.
+	resolved, err := os.ReadFile(filepath.Join(repo, "package-lock.json"))
+	if err != nil {
+		t.Fatalf("read resolved lockfile: %v", err)
+	}
+	seed, err := os.ReadFile(filepath.Join(assets, "package-lock.json"))
+	if err != nil {
+		t.Fatalf("read seed lockfile: %v", err)
+	}
+	if bytes.Equal(resolved, seed) {
+		t.Fatalf("npm install was expected to rewrite the lockfile, got the seed")
+	}
+	stamp, err := os.ReadFile(filepath.Join(repo, "node_modules", ".fe-lock-stamp"))
+	if err != nil {
+		t.Fatalf("no stamp: %v", err)
+	}
+	if string(stamp) != DepsStamp(pkg, resolved) {
+		t.Errorf("stamp = %q, want %q (the tree npm installed)", stamp, DepsStamp(pkg, resolved))
 	}
 }
 
@@ -690,7 +711,7 @@ func TestPipelineReplacesCorruptCachedLock(t *testing.T) {
 	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.1\"}\n")
 	key := DepsStamp(pkg, seed)
 	const corrupt = "not json\n"
-	if _, err := storeCachedLock(deps, key, []byte(corrupt)); err != nil {
+	if err := storeCachedLock(deps, key, []byte(corrupt)); err != nil {
 		t.Fatal(err)
 	}
 	// npm ci cannot install the corrupt entry, so the probe fails too and the
