@@ -259,11 +259,13 @@ func TestRerunAfterBuildFailure(t *testing.T) {
 
 func TestPipelineLockfileDesyncResolves(t *testing.T) {
 	repo, assets, _ := fixtureRepo(t)
-	p, fake := newPipeline(t, assets)
+	deps := t.TempDir()
+	p, fake := newPipelineDeps(t, assets, deps)
 	// The preset fails both the install and the --dry-run probe, so npm ci
 	// fails for a desync and the pipeline re-resolves.
 	fake.FailNpmCI = testutil.NpmCIFailAlways
-	testutil.WriteFile(t, repo, "package.json", `{"name":"lampa","version":"0.0.2"}`+"\n")
+	pkg := []byte("{\"name\":\"lampa\",\"version\":\"0.0.2\"}\n")
+	testutil.WriteFile(t, repo, "package.json", string(pkg))
 	testutil.CommitAll(t, repo, "bump deps")
 	log := &bytes.Buffer{}
 	if err := p.Run(context.Background(), repo, "HEAD", "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), log); err != nil {
@@ -283,6 +285,58 @@ func TestPipelineLockfileDesyncResolves(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), "re-resolving") {
 		t.Errorf("warning missing from log:\n%s", log)
+	}
+
+	// The resolution is frozen: it is what npm was given and what the cache
+	// now holds, so the next build never resolves again.
+	installed, err := os.ReadFile(filepath.Join(repo, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, err := os.ReadFile(filepath.Join(assets, "package-lock.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(installed, seed) {
+		t.Fatal("npm install was expected to rewrite the lockfile")
+	}
+	cached, ok, err := loadCachedLock(deps, DepsStamp(pkg, seed))
+	if err != nil || !ok {
+		t.Fatalf("cold resolve must freeze the lockfile: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(cached, installed) {
+		t.Errorf("cached = %q, want the resolved %q", cached, installed)
+	}
+}
+
+// After a cold resolve the frozen entry is the effective lockfile, and the
+// stamp written for it makes the next build skip the install entirely.
+func TestPipelineSecondBuildSkipsInstallAfterResolve(t *testing.T) {
+	repo, assets, _ := fixtureRepo(t)
+	deps := t.TempDir()
+	p, fake := newPipelineDeps(t, assets, deps)
+	fake.FailNpmCI = testutil.NpmCIFailAlways
+	testutil.WriteFile(t, repo, "package.json", "{\"name\":\"lampa\",\"version\":\"0.0.2\"}\n")
+	testutil.CommitAll(t, repo, "bump deps")
+	if err := p.Run(context.Background(), repo, "HEAD", "test.example", filepath.Join(t.TempDir(), "a.tar.gz"), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A working npm now: the entry is in sync, so npm ci would succeed — the
+	// point is that neither it nor npm install runs at all.
+	fake.FailNpmCI = nil
+	before := len(fake.CallsSnapshot())
+	log := &bytes.Buffer{}
+	if err := p.Run(context.Background(), repo, "HEAD", "test.example", filepath.Join(t.TempDir(), "b.tar.gz"), log); err != nil {
+		t.Fatalf("second build: %v\nlog:\n%s", err, log)
+	}
+	for _, c := range fake.CallsSnapshot()[before:] {
+		if strings.HasPrefix(c, "npm ci") || strings.HasPrefix(c, "npm install") {
+			t.Errorf("second build must skip the install, calls: %v", fake.CallsSnapshot()[before:])
+		}
+	}
+	if !strings.Contains(log.String(), "cached lockfile") {
+		t.Errorf("second build must use the frozen lockfile:\n%s", log)
 	}
 }
 

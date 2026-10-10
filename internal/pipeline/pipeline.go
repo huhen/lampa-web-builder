@@ -305,6 +305,23 @@ func (p *Pipeline) stepDeps(ctx context.Context, workDir string, log io.Writer) 
 		if err := p.run(ctx, log, workDir, []string{"npm", "install", "--no-audit", "--no-fund"}); err != nil {
 			return fmt.Errorf("npm install failed: %w", err)
 		}
+		// npm rewrote the lockfile: freeze that resolution under the key so
+		// every later build of this (manifest, seed) pair installs the same
+		// tree instead of resolving again.
+		resolved, err := os.ReadFile(filepath.Join(workDir, "package-lock.json"))
+		if err != nil {
+			return err
+		}
+		want = DepsStamp(pkgRaw, resolved)
+		pruned, err := storeCachedLock(p.DepsDir, key, resolved)
+		if err != nil {
+			fmt.Fprintf(log, "WARN: cannot cache the resolved lockfile: %v\n", err)
+		} else {
+			fmt.Fprintf(log, "deps: froze the resolved lockfile as %s\n", stampShort([]byte(key)))
+			if pruned > 0 {
+				fmt.Fprintf(log, "deps: pruned %d old cached lockfiles\n", pruned)
+			}
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(stampPath), 0o755); err != nil {
 		return err
